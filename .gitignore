@@ -11,6 +11,4 @@ env/
 tmp/
 output/
 
-# Resume PDFs usually contain private information. Remove this rule only if you
-# intentionally want to publish a sanitized sample PDF.
 *.pdf
