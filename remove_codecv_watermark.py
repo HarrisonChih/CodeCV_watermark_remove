@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Remove CodeCV's tiled PDF watermark from exported resumes."""
+"""Remove tiled PDF watermarks from exported resumes.
+
+Two watermark flavours are supported:
+
+* CodeCV pattern watermarks, drawn with a ``/Pattern`` colour space fill.
+* Large semi-transparent image watermarks: an ``/Image`` XObject carrying an
+  ``/SMask`` (alpha) that is big enough to overlay the page.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +19,8 @@ from pypdf.generic import ContentStream, DecodedStreamObject, NameObject
 
 
 DEFAULT_OUTPUT_SUFFIX = ".clean.pdf"
+MIN_WATERMARK_IMAGE_WIDTH = 1000
+MIN_WATERMARK_IMAGE_HEIGHT = 600
 
 
 def _is_name(value, expected: str) -> bool:
@@ -61,28 +70,99 @@ def _is_pattern_fill(operations, index: int) -> tuple[int, str | None]:
     return fill_index + 2 - index, fill_pattern
 
 
+def _watermark_image_names(page) -> set[str]:
+    """Return names of large semi-transparent images that act as watermarks."""
+    resources = page.get("/Resources")
+    xobjects = resources.get("/XObject") if resources else None
+    names = set()
+    if not xobjects:
+        return names
+
+    for name, obj in xobjects.items():
+        image = obj.get_object() if hasattr(obj, "get_object") else obj
+        if not hasattr(image, "get"):
+            continue
+        if image.get("/Subtype") != "/Image" or "/SMask" not in image:
+            continue
+        try:
+            width = int(image.get("/Width", 0))
+            height = int(image.get("/Height", 0))
+        except (TypeError, ValueError):
+            continue
+        if width >= MIN_WATERMARK_IMAGE_WIDTH and height >= MIN_WATERMARK_IMAGE_HEIGHT:
+            names.add(str(name))
+
+    return names
+
+
+def _discard_unused_patterns(resources, removed_patterns: set[str]) -> None:
+    if not removed_patterns:
+        return
+    patterns = resources.get("/Pattern")
+    if not patterns:
+        return
+    for pattern_name in removed_patterns:
+        patterns.pop(NameObject(pattern_name), None)
+    if not patterns:
+        resources.pop(NameObject("/Pattern"), None)
+
+
+def _discard_unused_xobjects(resources, removed_xobjects: set[str], operations) -> None:
+    if not removed_xobjects:
+        return
+    xobjects = resources.get("/XObject")
+    if not xobjects:
+        return
+    still_used = {
+        str(op[0][0])
+        for op in operations
+        if op[1] == b"Do" and op[0] and isinstance(op[0][0], NameObject)
+    }
+    for xobject_name in removed_xobjects:
+        if xobject_name not in still_used:
+            xobjects.pop(NameObject(xobject_name), None)
+    if not xobjects:
+        resources.pop(NameObject("/XObject"), None)
+
+
 def _remove_page_watermark(page, pdf) -> int:
     contents = page.get_contents()
     if contents is None:
         return 0
 
+    watermark_images = _watermark_image_names(page)
+
     stream = ContentStream(contents, pdf)
     old_operations = stream.operations
     new_operations = []
     removed_patterns = set()
+    removed_xobjects = set()
     index = 0
 
     while index < len(old_operations):
-        matched_count, pattern_name = _is_pattern_fill(old_operations, index)
-        if matched_count:
+        pattern_count, pattern_name = _is_pattern_fill(old_operations, index)
+        if pattern_count:
             removed_patterns.add(pattern_name)
-            index += matched_count
+            index += pattern_count
             continue
 
-        new_operations.append(old_operations[index])
+        op = old_operations[index]
+        if (
+            watermark_images
+            and op[1] == b"Do"
+            and op[0]
+            and isinstance(op[0][0], NameObject)
+            and str(op[0][0]) in watermark_images
+        ):
+            removed_xobjects.add(str(op[0][0]))
+            index += 1
+            continue
+
+        new_operations.append(op)
         index += 1
 
-    if not removed_patterns:
+    removed_count = len(removed_patterns) + len(removed_xobjects)
+    if not removed_count:
         return 0
 
     stream.operations = new_operations
@@ -91,20 +171,18 @@ def _remove_page_watermark(page, pdf) -> int:
     page.replace_contents(replacement)
 
     resources = page.get("/Resources")
-    patterns = resources.get("/Pattern") if resources else None
-    if patterns:
-        for pattern_name in removed_patterns:
-            patterns.pop(NameObject(pattern_name), None)
-        if not patterns:
-            resources.pop(NameObject("/Pattern"), None)
+    if resources:
+        _discard_unused_patterns(resources, removed_patterns)
+        _discard_unused_xobjects(resources, removed_xobjects, new_operations)
 
-    return len(removed_patterns)
+    return removed_count
 
 
 def remove_watermark(input_pdf: str | Path, output_pdf: str | Path) -> int:
-    """Remove CodeCV tiled pattern watermarks and write a cleaned PDF.
+    """Remove tiled watermarks and write a cleaned PDF.
 
-    Returns the number of page-level watermark pattern fills removed.
+    Handles both CodeCV pattern fills and large semi-transparent image
+    overlays. Returns the number of page-level watermark elements removed.
     """
     input_path = Path(input_pdf)
     output_path = Path(output_pdf)
@@ -129,7 +207,7 @@ def default_output_path(input_pdf: Path) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Remove CodeCV's tiled watermark from an exported resume PDF."
+        description="Remove tiled watermarks from an exported resume PDF."
     )
     parser.add_argument("input_pdf", type=Path, help="Path to the exported CodeCV PDF")
     parser.add_argument(
@@ -145,7 +223,7 @@ def main() -> int:
     args = parse_args()
     output_pdf = args.output_pdf or default_output_path(args.input_pdf)
     removed = remove_watermark(args.input_pdf, output_pdf)
-    print(f"Removed {removed} CodeCV watermark pattern fill(s).")
+    print(f"Removed {removed} watermark element(s).")
     print(f"Wrote: {output_pdf}")
     return 0 if removed else 1
 
